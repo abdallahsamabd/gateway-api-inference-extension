@@ -160,7 +160,7 @@ func (s *Server) executePlugins(ctx context.Context, headers map[string]string, 
 	updatedBody := body
 	var err error
 	for _, plugin := range plugins {
-		log.FromContext(ctx).Info("Executing request plugin", "plugin", plugin.TypedName())
+		log.FromContext(ctx).Info("Executing plugin", "plugin", plugin.TypedName())
 		updatedHeaders, updatedBody, err = plugin.Execute(ctx, updatedHeaders, updatedBody)
 		if err != nil {
 			return fmt.Errorf("failed to execute payload processor %s - %w", plugin.TypedName(), err)

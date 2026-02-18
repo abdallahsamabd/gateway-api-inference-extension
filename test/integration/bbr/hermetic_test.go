@@ -19,12 +19,16 @@ package bbr
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	extProcPb "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/testing/protocmp"
+
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/framework"
+	epp "sigs.k8s.io/gateway-api-inference-extension/pkg/epp/framework/interface/plugin"
 	"sigs.k8s.io/gateway-api-inference-extension/test/integration"
 )
 
@@ -135,5 +139,130 @@ func TestFullDuplexStreamed_BodyBasedRouting(t *testing.T) {
 				t.Errorf("Response mismatch (-want +got): %v", diff)
 			}
 		})
+	}
+}
+
+// testResponsePlugin implements framework.PayloadProcessor for integration testing response plugins.
+type testResponsePlugin struct {
+	name     string
+	mutateFn func(ctx context.Context, headers map[string]string, body map[string]any) (map[string]string, map[string]any, error)
+}
+
+func (p *testResponsePlugin) TypedName() epp.TypedName {
+	return epp.TypedName{Type: "test", Name: p.name}
+}
+
+func (p *testResponsePlugin) Execute(ctx context.Context, headers map[string]string, body map[string]any) (map[string]string, map[string]any, error) {
+	return p.mutateFn(ctx, headers, body)
+}
+
+var _ framework.PayloadProcessor = &testResponsePlugin{}
+
+// TestResponsePlugins_Unary validates response plugin execution over a real gRPC ext_proc stream (unary mode).
+func TestResponsePlugins_Unary(t *testing.T) {
+	t.Parallel()
+
+	// A response plugin that adds a "filtered" field to the response body.
+	guardrailPlugin := &testResponsePlugin{
+		name: "guardrail",
+		mutateFn: func(_ context.Context, headers map[string]string, body map[string]any) (map[string]string, map[string]any, error) {
+			body["filtered"] = true
+			return headers, body, nil
+		},
+	}
+
+	ctx := context.Background()
+	h := NewBBRHarnessWithPlugins(t, ctx, false, nil, []framework.PayloadProcessor{guardrailPlugin})
+
+	// Phase 1: Send a request body (unary). BBR processes request path.
+	reqBody := integration.ReqLLMUnary(logger, "test", "llama")
+	reqResp, err := integration.SendRequest(t, h.Client, reqBody)
+	require.NoError(t, err, "unexpected error during request processing")
+
+	wantReqResp := ExpectBBRUnaryResponse("llama")
+	if diff := cmp.Diff(wantReqResp, reqResp, protocmp.Transform()); diff != "" {
+		t.Errorf("Request response mismatch (-want +got): %v", diff)
+	}
+
+	// Phase 2: Send response headers (passthrough).
+	respHeaderReq := &extProcPb.ProcessingRequest{
+		Request: &extProcPb.ProcessingRequest_ResponseHeaders{
+			ResponseHeaders: &extProcPb.HttpHeaders{},
+		},
+	}
+	respHeaderResp, err := integration.SendRequest(t, h.Client, respHeaderReq)
+	require.NoError(t, err, "unexpected error during response header processing")
+
+	wantRespHeaderResp := &extProcPb.ProcessingResponse{
+		Response: &extProcPb.ProcessingResponse_ResponseHeaders{
+			ResponseHeaders: &extProcPb.HeadersResponse{},
+		},
+	}
+	if diff := cmp.Diff(wantRespHeaderResp, respHeaderResp, protocmp.Transform()); diff != "" {
+		t.Errorf("Response headers mismatch (-want +got): %v", diff)
+	}
+
+	// Phase 3: Send a response body. The guardrail plugin should mutate it.
+	originalResponseBody := []byte(`{"choices":[{"text":"Hello World"}]}`)
+	respBodyReq := &extProcPb.ProcessingRequest{
+		Request: &extProcPb.ProcessingRequest_ResponseBody{
+			ResponseBody: &extProcPb.HttpBody{
+				Body:        originalResponseBody,
+				EndOfStream: true,
+			},
+		},
+	}
+	respBodyResp, err := integration.SendRequest(t, h.Client, respBodyReq)
+	require.NoError(t, err, "unexpected error during response body processing")
+
+	// The plugin should have added "filtered": true.
+	mutatedBody := respBodyResp.GetResponseBody().GetResponse().GetBodyMutation().GetBody()
+	var gotBody map[string]any
+	require.NoError(t, json.Unmarshal(mutatedBody, &gotBody), "failed to unmarshal mutated response body")
+	require.Equal(t, true, gotBody["filtered"], "expected 'filtered' field to be true after response plugin execution")
+}
+
+// TestResponsePlugins_NoPlugins_Unary validates that the response path is passthrough
+// when no response plugins are configured, over a real gRPC stream.
+func TestResponsePlugins_NoPlugins_Unary(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	h := NewBBRHarness(t, ctx, false)
+
+	// Phase 1: Send request body.
+	reqBody := integration.ReqLLMUnary(logger, "test", "llama")
+	_, err := integration.SendRequest(t, h.Client, reqBody)
+	require.NoError(t, err)
+
+	// Phase 2: Send response headers.
+	respHeaderReq := &extProcPb.ProcessingRequest{
+		Request: &extProcPb.ProcessingRequest_ResponseHeaders{
+			ResponseHeaders: &extProcPb.HttpHeaders{},
+		},
+	}
+	_, err = integration.SendRequest(t, h.Client, respHeaderReq)
+	require.NoError(t, err)
+
+	// Phase 3: Send response body -- should be passthrough (empty BodyResponse).
+	respBodyReq := &extProcPb.ProcessingRequest{
+		Request: &extProcPb.ProcessingRequest_ResponseBody{
+			ResponseBody: &extProcPb.HttpBody{
+				Body:        []byte(`{"choices":[{"text":"Hello World"}]}`),
+				EndOfStream: true,
+			},
+		},
+	}
+	respBodyResp, err := integration.SendRequest(t, h.Client, respBodyReq)
+	require.NoError(t, err)
+
+	wantPassthrough := &extProcPb.ProcessingResponse{
+		Response: &extProcPb.ProcessingResponse_ResponseBody{
+			ResponseBody: &extProcPb.BodyResponse{},
+		},
+	}
+
+	if diff := cmp.Diff(wantPassthrough, respBodyResp, protocmp.Transform()); diff != "" {
+		t.Errorf("Response body mismatch (-want +got): %v", diff)
 	}
 }
