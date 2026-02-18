@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc"
 
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/datastore"
+	"sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/framework"
 	runserver "sigs.k8s.io/gateway-api-inference-extension/pkg/bbr/server"
 	logutil "sigs.k8s.io/gateway-api-inference-extension/pkg/common/observability/logging"
 	"sigs.k8s.io/gateway-api-inference-extension/test/integration"
@@ -45,6 +46,11 @@ type BBRHarness struct {
 // NewBBRHarness boots up an isolated BBR server on a random port.
 // streaming: determines if the BBR server runs in streaming mode or unary/buffered mode.
 func NewBBRHarness(t *testing.T, ctx context.Context, streaming bool) *BBRHarness {
+	return NewBBRHarnessWithPlugins(t, ctx, streaming, nil, nil)
+}
+
+// NewBBRHarnessWithPlugins boots up an isolated BBR server with custom request and response plugins.
+func NewBBRHarnessWithPlugins(t *testing.T, ctx context.Context, streaming bool, requestPlugins []framework.PayloadProcessor, responsePlugins []framework.PayloadProcessor) *BBRHarness {
 	t.Helper()
 
 	// 1. Allocate Free Port
@@ -52,11 +58,12 @@ func NewBBRHarness(t *testing.T, ctx context.Context, streaming bool) *BBRHarnes
 	require.NoError(t, err, "failed to acquire free port for BBR server")
 
 	// 2. Configure BBR Server
-	// BBR is simpler than EPP; it doesn't need a K8s Manager.
 	runner := runserver.NewDefaultExtProcServerRunner(port, false)
 	runner.SecureServing = false
 	runner.Streaming = streaming
 	runner.Datastore = datastore.NewDatastore()
+	runner.RequestPlugins = requestPlugins
+	runner.ResponsePlugins = responsePlugins
 
 	// 3. Start Server in Background
 	serverCtx, serverCancel := context.WithCancel(ctx)
