@@ -52,7 +52,7 @@ type BBRHarness struct {
 }
 
 // NewBBRHarness boots up an isolated BBR server on a random port with the default
-// BodyFieldToHeaderPlugin for model extraction.
+// BodyFieldToHeaderPlugin for model extraction and no response plugins.
 func NewBBRHarness(t *testing.T, ctx context.Context, streaming bool) *BBRHarness {
 	t.Helper()
 	modelToHeaderPlugin, err := plugins.NewBodyFieldToHeaderPlugin(handlers.ModelField, handlers.ModelHeader)
@@ -61,11 +61,18 @@ func NewBBRHarness(t *testing.T, ctx context.Context, streaming bool) *BBRHarnes
 	baseModelToHeaderPlugin, err := bbrtest.NewTestBaseModelPlugin()
 	require.NoError(t, err, "failed to create base model plugin")
 
-	return NewBBRHarnessWithPlugins(t, ctx, streaming, []framework.RequestProcessor{modelToHeaderPlugin, baseModelToHeaderPlugin})
+	return NewBBRHarnessWithPlugins(t, ctx, streaming, []framework.RequestProcessor{modelToHeaderPlugin, baseModelToHeaderPlugin}, nil)
 }
 
-// NewBBRHarnessWithPlugins boots up an isolated BBR server with custom request plugins.
-func NewBBRHarnessWithPlugins(t *testing.T, ctx context.Context, streaming bool, requestPlugins []framework.RequestProcessor) *BBRHarness {
+// NewBBRHarnessWithPlugins boots up an isolated BBR server on a random port
+// with the given request and response plugins.
+func NewBBRHarnessWithPlugins(
+	t *testing.T,
+	ctx context.Context,
+	streaming bool,
+	requestPlugins []framework.RequestProcessor,
+	responsePlugins []framework.ResponseProcessor,
+) *BBRHarness {
 	t.Helper()
 
 	// 1. Allocate Free Port
@@ -76,7 +83,17 @@ func NewBBRHarnessWithPlugins(t *testing.T, ctx context.Context, streaming bool,
 	runner := runserver.NewDefaultExtProcServerRunner(port, false)
 	runner.SecureServing = false
 	runner.Streaming = streaming
+	if requestPlugins == nil {
+		modelToHeaderPlugin, err := plugins.NewBodyFieldToHeaderPlugin(handlers.ModelField, handlers.ModelHeader)
+		require.NoError(t, err, "failed to create body-field-to-header plugin")
+
+		baseModelPlugin, err := bbrtest.NewTestBaseModelPlugin()
+		require.NoError(t, err, "failed to create base model plugin")
+
+		requestPlugins = []framework.RequestProcessor{modelToHeaderPlugin, baseModelPlugin}
+	}
 	runner.RequestPlugins = requestPlugins
+	runner.ResponsePlugins = responsePlugins
 
 	// Find the BaseModelToHeaderPlugin in the requestPlugins to configure it
 	var baseModelToHeaderPlugin *basemodelextractor.BaseModelToHeaderPlugin
@@ -89,7 +106,6 @@ func NewBBRHarnessWithPlugins(t *testing.T, ctx context.Context, streaming bool,
 
 	// Configure the BaseModelToHeaderPlugin with test data if it exists
 	if baseModelToHeaderPlugin != nil {
-		// Create a test ConfigMap with model mappings
 		testConfigMap := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "test-model-mappings",
@@ -108,18 +124,14 @@ func NewBBRHarnessWithPlugins(t *testing.T, ctx context.Context, streaming bool,
 			},
 		}
 
-		// Get the reconciler from the plugin and set it up with a fake manager
 		reconciler := baseModelToHeaderPlugin.GetReconciler()
 
-		// Create a fake client with the test ConfigMap
 		fakeClient := fake.NewClientBuilder().
 			WithObjects(testConfigMap).
 			Build()
 
-		// Set the Reader on the reconciler
 		reconciler.Reader = fakeClient
 
-		// Call Reconcile() to update the adapters store with test data
 		req := ctrl.Request{
 			NamespacedName: types.NamespacedName{
 				Namespace: testConfigMap.Namespace,
